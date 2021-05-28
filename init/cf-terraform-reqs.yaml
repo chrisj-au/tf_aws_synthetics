@@ -1,0 +1,299 @@
+---
+# Creates the required resources to run Terraform
+# Credit: https://github.com/thirstydeveloper/terraform-terragrunt-skeleton/blob/master/init/admin/init-admin-account.cf.yml
+# https://www.terraform.io/docs/backends/types/s3.html
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Initialize terraform admin account
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Admin Account Config
+        Parameters:
+          - AdminAccountId
+      - Label:
+          default: Terraform State Resources
+        Parameters:
+          - StateBucketName
+          - StateLogBucketName
+          - LockTableName
+Parameters:
+  AdminAccountId:
+    Type: String
+    Description: Account ID of the admin account to contain the state
+  StateBucketName:
+    Type: String
+    Description: Name of the S3 bucket for terraform state
+  StateLogBucketName:
+    Type: String
+    Description: Name of the S3 bucket for terraform state logs
+  LockTableName:
+    Type: String
+    Description: Name of the terraform DynamoDB lock table
+
+Rules:
+  EnsureDeployingToCorrectAccount:
+    Assertions:
+      - Assert: !Equals
+          - !Ref AWS::AccountId
+          - !Ref AdminAccountId
+        AssertDescription: 'Stack can only be deployed into the specified AdminAccountId'
+
+Resources:
+  TerraformStateLogBucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref StateLogBucketName
+      AccessControl: LogDeliveryWrite
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+
+  TerraformStateBucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref StateBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      LoggingConfiguration:
+        DestinationBucketName: !Ref StateLogBucketName
+        LogFilePrefix: TFStateLogs/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      VersioningConfiguration:
+        Status: Enabled
+
+  TerraformStateLockTable:
+    Type: 'AWS::DynamoDB::Table'
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Ref LockTableName
+      AttributeDefinitions:
+        - AttributeName: LockID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: LockID
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  TerraformStateReadWritePolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: TerraformStateReadWrite
+      Path: /terraform/
+      Description: Read/write access to terraform state
+      PolicyDocument:
+        Version: 2012-10-17
+        # Permissions are based on:
+        # https://www.terraform.io/docs/backends/types/s3.html#example-configuration
+        # https://github.com/gruntwork-io/terragrunt/issues/919
+        Statement:
+          - Sid: AllowStateBucketList
+            Effect: Allow
+            Action:
+              - 's3:ListBucket'
+              - 's3:GetBucketVersioning'
+            Resource: !Sub "arn:aws:s3:::${StateBucketName}"
+          - Sid: AllowStateReadWrite
+            Effect: Allow
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+            Resource: !Sub "arn:aws:s3:::${StateBucketName}/*"
+          - Sid: AllowStateLockReadWrite
+            Effect: Allow
+            Action:
+              - 'dynamodb:DescribeTable'
+              - 'dynamodb:GetItem'
+              - 'dynamodb:PutItem'
+              - 'dynamodb:DeleteItem'
+            Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${LockTableName}"
+
+  TerraformBackendRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref AWS::AccountId
+            Action:
+              - 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                aws:PrincipalType: User
+              #StringLike:
+              #  'aws:PrincipalTag/Terraformer': '*'
+      RoleName: TerraformBackend
+      Path: /terraform/
+      ManagedPolicyArns:
+        - !Ref TerraformStateReadWritePolicy
+
+  TerraformStateBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Bucket: !Ref TerraformStateBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          ################################################
+          # Require TLS always
+          ################################################
+
+          - Sid: 'AllowTLSRequestsOnly'
+            Principal: '*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+            Effect: Deny
+            Action: '*'
+            Resource:
+              - !GetAtt "TerraformStateBucket.Arn"
+              - !Sub
+                - "${Bucket}/*"
+                - Bucket: !GetAtt "TerraformStateBucket.Arn"
+
+          ################################################
+          # User permissions
+          ################################################
+
+          # If principal is an IAM user and that user does
+          # not have the Terraformer tag, deny everything
+          - Sid: DenyNonTerraformerUsers
+            Principal: "*"
+            Condition:
+              StringEquals:
+                aws:PrincipalType: User
+              StringNotLike:
+                'aws:PrincipalTag/Terraformer': '*'
+            Effect: Deny
+            Action: '*'
+            Resource:
+              - !GetAtt "TerraformStateBucket.Arn"
+              - !Sub
+                - "${Bucket}/*"
+                - Bucket: !GetAtt "TerraformStateBucket.Arn"
+
+          # If principal is an IAM user and that user has the Terraformer tag,
+          # but the tag value is not set to Admin, limit to read/write access.
+          # By extension, if the user has the Terraformer tag set to Admin, this
+          # policy places no restriction, granting that user whatever access is
+          # specified in their IAM user policy.
+          - Sid: RestrictTerraformNonAdmins
+            Principal: "*"
+            Condition:
+              StringEquals:
+                aws:PrincipalType: User
+              StringLike:
+                'aws:PrincipalTag/Terraformer': '*'
+              StringNotEquals:
+                'aws:PrincipalTag/Terraformer': 'Admin'
+            Effect: Deny
+            NotAction:
+              - 's3:List*'
+              - 's3:Get*'
+              - 's3:Describe*'
+              - 's3:PutObject'
+              # Granting DeleteObject is safe because we have versioning enabled
+              # on the bucket. DeleteObjectVersion is what we have to restrict
+              # so that someone can't delete the delete marker and thereby
+              # permanently delete state. Granting DeleteObject is helpful
+              # because it allows NonAdmins to migrate state (i.e., rename state
+              # files)
+              - 's3:DeleteObject'
+            Resource:
+              - !GetAtt "TerraformStateBucket.Arn"
+              - !Sub
+                - "${Bucket}/*"
+                - Bucket: !GetAtt "TerraformStateBucket.Arn"
+
+          ################################################
+          # Role permissions
+          ################################################
+
+          # https://aws.amazon.com/blogs/security/how-to-restrict-amazon-s3-bucket-access-to-a-specific-iam-role/
+
+          # If the principal is an assumed IAM role and that role is not the
+          # backend role, deny access.
+          - Sid: DenyNonBackendRoles
+            Principal: "*"
+            Condition:
+              StringEquals:
+                aws:PrincipalType: AssumedRole
+              StringNotLike:
+                aws:userId:
+                  - !Sub
+                    - "${TerraformBackendRoleId}:*"
+                    - TerraformBackendRoleId: !GetAtt "TerraformBackendRole.RoleId"
+            Effect: Deny
+            Action: '*'
+            Resource:
+              - !GetAtt "TerraformStateBucket.Arn"
+              - !Sub
+                - "${Bucket}/*"
+                - Bucket: !GetAtt "TerraformStateBucket.Arn"
+
+          # If the principal is an assumed IAM role and that role is the
+          # backend role, limit to read/write access.
+          - Sid: ResrictBackendRoleToReadWrite
+            Principal: "*"
+            Condition:
+              StringEquals:
+                aws:PrincipalType: AssumedRole
+              StringLike:
+                aws:userId:
+                  - !Sub
+                    - "${TerraformBackendRoleId}:*"
+                    - TerraformBackendRoleId: !GetAtt "TerraformBackendRole.RoleId"
+            Effect: Deny
+            NotAction:
+              - 's3:ListBucket'
+              - 's3:GetBucketVersioning'
+              - 's3:GetObject'
+              - 's3:PutObject'
+            Resource:
+              - !GetAtt "TerraformStateBucket.Arn"
+              - !Sub
+                - "${Bucket}/*"
+                - Bucket: !GetAtt "TerraformStateBucket.Arn"
+
+          ################################################
+          # Default deny
+          ################################################
+
+          # https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_variables.html#principaltable
+
+          - Sid: DenyAllOtherPrincipals
+            Principal: "*"
+            Condition:
+              StringNotEquals:
+                aws:PrincipalType:
+                  - AssumedRole
+                  - Account
+                  - User
+            Effect: Deny
+            Action: '*'
+            Resource:
+              - !GetAtt "TerraformStateBucket.Arn"
+              - !Sub
+                - "${Bucket}/*"
+                - Bucket: !GetAtt "TerraformStateBucket.Arn"
